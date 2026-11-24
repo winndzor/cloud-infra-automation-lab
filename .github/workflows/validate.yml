@@ -1,0 +1,102 @@
+name: Terraform validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Format, validate, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.1
+          terraform_wrapper: false
+
+      - name: Create provider cache
+        run: |
+          echo "TF_PLUGIN_CACHE_DIR=${RUNNER_TEMP}/terraform-plugin-cache" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/terraform-plugin-cache"
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Test immutable worker release records
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          python3 scripts/worker_release.py verify-release \
+            --release environments/lab/worker-release.json
+
+      - name: Initialize WIF module
+        working-directory: modules/github-oidc-wif
+        run: terraform init -backend=false -input=false
+
+      - name: Validate WIF module
+        working-directory: modules/github-oidc-wif
+        run: terraform validate -no-color
+
+      - name: Test WIF module
+        working-directory: modules/github-oidc-wif
+        run: terraform test -no-color
+
+      - name: Initialize synthetic delivery module
+        working-directory: modules/event-metadata-worker
+        run: terraform init -backend=false -input=false
+
+      - name: Validate synthetic delivery module
+        working-directory: modules/event-metadata-worker
+        run: terraform validate -no-color
+
+      - name: Test synthetic delivery module
+        working-directory: modules/event-metadata-worker
+        run: terraform test -no-color
+
+      - name: Initialize delivery foundation without its backend
+        working-directory: bootstrap/foundation
+        run: terraform init -backend=false -input=false
+
+      - name: Validate delivery foundation
+        working-directory: bootstrap/foundation
+        run: terraform validate -no-color
+
+      - name: Test delivery foundation
+        working-directory: bootstrap/foundation
+        run: terraform test -no-color
+
+      - name: Initialize lab without a backend
+        working-directory: environments/lab
+        run: terraform init -backend=false -input=false
+
+      - name: Validate lab
+        working-directory: environments/lab
+        run: terraform validate -no-color
+
+      - name: Test lab
+        working-directory: environments/lab
+        run: terraform test -no-color
+
+      - name: Test synthetic worker container
+        run: |
+          docker build \
+            --target test \
+            --tag event-metadata-worker-test:${GITHUB_SHA} \
+            services/event-metadata-worker

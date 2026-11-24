@@ -1,0 +1,231 @@
+name: Synthetic worker image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: synthetic-worker-image
+  cancel-in-progress: false
+
+env:
+  REGISTRY_HOST: europe-central2-docker.pkg.dev
+  IMAGE_URI: europe-central2-docker.pkg.dev/example-gcp-project/cloud-infra-lab/event-metadata-worker
+  SERVICE_DIR: services/event-metadata-worker
+  BUILD_EVIDENCE_DIR: .artifacts/synthetic-worker-build
+  BUILD_MANIFEST_NAME: worker-build-manifest.json
+  BUILD_ARTIFACT_NAME: synthetic-worker-build-${{ github.run_attempt }}
+
+jobs:
+  build:
+    name: Test and publish immutable worker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Require main branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::This workflow accepts only refs/heads/main."
+          exit 1
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify owner dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            | jq -e \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              --arg commit_sha "${GITHUB_SHA}" \
+              '
+                .repository.full_name == $repository and
+                .path == ".github/workflows/container-build.yml" and
+                .event == "workflow_dispatch" and
+                .head_branch == "main" and
+                .head_sha == $commit_sha and
+                .triggering_actor.id == 38678897
+              ' >/dev/null
+
+      - name: Build unit-test image target
+        working-directory: ${{ env.SERVICE_DIR }}
+        run: |
+          docker build \
+            --target test \
+            --tag event-metadata-worker-test:${GITHUB_SHA} \
+            .
+
+      - name: Set up attestation-capable Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Authenticate as the build identity
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/123456789012/locations/global/workloadIdentityPools/github-cloud-infra-lab/providers/github-oidc
+          service_account: cloud-infra-lab-build@example-gcp-project.iam.gserviceaccount.com
+          project_id: example-gcp-project
+          token_format: access_token
+          access_token_lifetime: 900s
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Log in to Artifact Registry
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          printf '%s' "${ACCESS_TOKEN}" \
+            | docker login \
+              --username oauth2accesstoken \
+              --password-stdin \
+              "https://${REGISTRY_HOST}"
+
+      - name: Build and publish commit image
+        id: publish
+        working-directory: ${{ env.SERVICE_DIR }}
+        run: |
+          metadata_file="${RUNNER_TEMP}/synthetic-worker-build.json"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=mode=max \
+            --sbom=true \
+            --tag "${IMAGE_URI}:${GITHUB_SHA}" \
+            --push \
+            --metadata-file "${metadata_file}" \
+            .
+
+          digest="$(jq -r '."containerimage.digest"' "${metadata_file}")"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Image build did not return a valid digest."
+            exit 1
+          fi
+
+          image_ref="${IMAGE_URI}@${digest}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "image_ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Inspect digest-bound SBOM and provenance
+        env:
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+        run: |
+          mkdir -p "${BUILD_EVIDENCE_DIR}"
+          sbom_raw="${RUNNER_TEMP}/sbom.raw.json"
+          provenance_raw="${RUNNER_TEMP}/provenance.raw.json"
+
+          if docker buildx imagetools inspect "${IMAGE_REF}" \
+            --format '{{ json (index .SBOM "linux/amd64").SPDX }}' \
+            > "${sbom_raw}" 2>/dev/null \
+            && jq -e 'type == "object"' "${sbom_raw}" >/dev/null; then
+            :
+          else
+            docker buildx imagetools inspect "${IMAGE_REF}" \
+              --format '{{ json .SBOM.SPDX }}' > "${sbom_raw}"
+          fi
+
+          if docker buildx imagetools inspect "${IMAGE_REF}" \
+            --format '{{ json (index .Provenance "linux/amd64").SLSA }}' \
+            > "${provenance_raw}" 2>/dev/null \
+            && jq -e 'type == "object"' "${provenance_raw}" >/dev/null; then
+            :
+          else
+            docker buildx imagetools inspect "${IMAGE_REF}" \
+              --format '{{ json .Provenance.SLSA }}' > "${provenance_raw}"
+          fi
+
+          jq -ceS \
+            'select(
+              type == "object" and
+              .SPDXID == "SPDXRef-DOCUMENT" and
+              (.spdxVersion | startswith("SPDX-"))
+            )' \
+            "${sbom_raw}" > "${BUILD_EVIDENCE_DIR}/sbom.json"
+          jq -ceS \
+            '
+              def buildkit_type:
+                . == "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md" or
+                startswith("https://mobyproject.org/buildkit@");
+              def buildkit:
+                (
+                  ((.buildType? // null) | type == "string") and
+                  (.buildType | buildkit_type) and
+                  ((.builder? // null) | type == "object")
+                ) or (
+                  ((.buildDefinition? // null) | type == "object") and
+                  (.buildDefinition.buildType | buildkit_type) and
+                  ((.runDetails? // {} | .builder? // null) | type == "object")
+                );
+              select(
+                type == "object" and
+                (buildkit or ((.predicate? // {}) | buildkit))
+              )
+            ' \
+            "${provenance_raw}" > "${BUILD_EVIDENCE_DIR}/provenance.json"
+
+      - name: Create immutable build manifest
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          service_tree="$(git rev-parse "${GITHUB_SHA}:${SERVICE_DIR}")"
+          python3 scripts/worker_release.py create-build-manifest \
+            --output "${BUILD_EVIDENCE_DIR}/${BUILD_MANIFEST_NAME}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --source-commit "${GITHUB_SHA}" \
+            --source-workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --source-run-id "${GITHUB_RUN_ID}" \
+            --source-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --service-tree "${service_tree}" \
+            --dockerfile "${SERVICE_DIR}/Dockerfile" \
+            --image-uri "${IMAGE_URI}" \
+            --image-digest "${IMAGE_DIGEST}" \
+            --platform "linux/amd64" \
+            --sbom "${BUILD_EVIDENCE_DIR}/sbom.json" \
+            --provenance "${BUILD_EVIDENCE_DIR}/provenance.json"
+          python3 scripts/worker_release.py verify-build-manifest \
+            --manifest "${BUILD_EVIDENCE_DIR}/${BUILD_MANIFEST_NAME}" \
+            --expected-digest "${IMAGE_DIGEST}" \
+            --expected-source-commit "${GITHUB_SHA}" \
+            --expected-run-id "${GITHUB_RUN_ID}" \
+            --expected-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --sbom "${BUILD_EVIDENCE_DIR}/sbom.json" \
+            --provenance "${BUILD_EVIDENCE_DIR}/provenance.json"
+
+      - name: Upload immutable build manifest
+        id: evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.BUILD_ARTIFACT_NAME }}
+          path: ${{ env.BUILD_EVIDENCE_DIR }}/${{ env.BUILD_MANIFEST_NAME }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish image summary
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+          ARTIFACT_NAME: ${{ env.BUILD_ARTIFACT_NAME }}
+        run: |
+          {
+            echo "## Synthetic worker image"
+            echo
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Registry digest: \`${IMAGE_DIGEST}\`"
+            echo "- Evidence: BuildKit SPDX SBOM and SLSA provenance attached to the digest"
+            echo "- Manifest artifact: \`${ARTIFACT_NAME}\`"
+            echo "- Manifest artifact digest: \`${ARTIFACT_DIGEST}\`"
+            echo "- Terraform image reference:"
+            echo
+            echo '```text'
+            echo "${IMAGE_REF}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

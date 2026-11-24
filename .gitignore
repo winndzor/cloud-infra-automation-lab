@@ -1,0 +1,53 @@
+# Terraform working directories and state
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+modules/**/.terraform.lock.hcl
+
+# Saved plans
+*.tfplan
+*.plan
+.artifacts/
+
+# Variable files may contain environment-specific or sensitive values
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Local CLI configuration and overrides
+.terraformrc
+terraform.rc
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Logs and crash output
+*.log
+crash.log
+crash.*.log
+
+# Python test and bytecode output
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+
+# Common local credentials and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*-credentials.json
+credentials*.json
+service-account*.json
+gha-creds-*.json
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,248 @@
+name: Terraform lab apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Terraform lab plan run ID
+        required: true
+        type: string
+      plan_sha256:
+        description: SHA-256 printed by the reviewed plan run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-lab-state
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_ROOT: environments/lab
+  PLAN_DIR: .artifacts/apply
+  PLAN_FILE: lab.tfplan
+
+jobs:
+  apply:
+    name: Verify and apply saved lab plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Require main branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::This workflow accepts only refs/heads/main."
+          exit 1
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate plan and apply runs
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          if [[ ! "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::source_run_id must contain only digits."
+            exit 1
+          fi
+
+          run_metadata_dir="${RUNNER_TEMP}/terraform-run-metadata"
+          mkdir -p "${run_metadata_dir}"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+            > "${run_metadata_dir}/source-run.json"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > "${run_metadata_dir}/apply-run.json"
+
+          jq -e \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit_sha "${GITHUB_SHA}" \
+            '
+              .repository.full_name == $repository and
+              .path == ".github/workflows/terraform-plan.yml" and
+              .event == "workflow_dispatch" and
+              .head_branch == "main" and
+              .head_sha == $commit_sha and
+              .status == "completed" and
+              .conclusion == "success" and
+              .triggering_actor.id == 38678897
+            ' "${run_metadata_dir}/source-run.json" >/dev/null
+
+          jq -e \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit_sha "${GITHUB_SHA}" \
+            '
+              .repository.full_name == $repository and
+              .path == ".github/workflows/terraform-apply.yml" and
+              .event == "workflow_dispatch" and
+              .head_branch == "main" and
+              .head_sha == $commit_sha and
+              .triggering_actor.id == 38678897
+            ' "${run_metadata_dir}/apply-run.json" >/dev/null
+
+          source_run_attempt="$(
+            jq -r '.run_attempt | tostring' "${run_metadata_dir}/source-run.json"
+          )"
+          artifact_name="terraform-lab-plan-${source_run_attempt}"
+          echo "source_run_attempt=${source_run_attempt}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download source plan bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: ${{ env.PLAN_DIR }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify plan bundle
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+          ARTIFACT_NAME: ${{ steps.source.outputs.artifact_name }}
+          REVIEWED_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+        run: |
+          for file in "${PLAN_FILE}" manifest.json plan.txt; do
+            if [[ ! -f "${PLAN_DIR}/${file}" || -L "${PLAN_DIR}/${file}" ]]; then
+              echo "::error::Missing or invalid bundle file: ${file}"
+              exit 1
+            fi
+          done
+
+          if [[ "$(ls -1A "${PLAN_DIR}" | wc -l)" -ne 3 ]]; then
+            echo "::error::The plan bundle contains unexpected files."
+            exit 1
+          fi
+
+          reviewed_plan_sha256="${REVIEWED_PLAN_SHA256,,}"
+          if [[ ! "${reviewed_plan_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::plan_sha256 must be a 64-character hexadecimal digest."
+            exit 1
+          fi
+
+          actual_plan_sha256="$(
+            sha256sum "${PLAN_DIR}/${PLAN_FILE}" | awk '{print $1}'
+          )"
+          actual_plan_text_sha256="$(
+            sha256sum "${PLAN_DIR}/plan.txt" | awk '{print $1}'
+          )"
+
+          if [[ "${actual_plan_sha256}" != "${reviewed_plan_sha256}" ]]; then
+            echo "::error::Saved-plan digest does not match the reviewed digest."
+            exit 1
+          fi
+
+          jq -e \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit_sha "${GITHUB_SHA}" \
+            --arg source_run_id "${SOURCE_RUN_ID}" \
+            --arg source_run_attempt "${SOURCE_RUN_ATTEMPT}" \
+            --arg source_workflow_ref \
+              "${GITHUB_REPOSITORY}/.github/workflows/terraform-plan.yml@refs/heads/main" \
+            --arg artifact_name "${ARTIFACT_NAME}" \
+            --arg plan_file "${PLAN_FILE}" \
+            --arg plan_sha256 "${actual_plan_sha256}" \
+            --arg plan_text_sha256 "${actual_plan_text_sha256}" \
+            '
+              .schema_version == 1 and
+              .repository == $repository and
+              .commit_sha == $commit_sha and
+              .source_run_id == $source_run_id and
+              .source_run_attempt == $source_run_attempt and
+              .source_workflow_ref == $source_workflow_ref and
+              .artifact_name == $artifact_name and
+              .plan_file == $plan_file and
+              .plan_sha256 == $plan_sha256 and
+              .plan_text_sha256 == $plan_text_sha256
+            ' "${PLAN_DIR}/manifest.json" >/dev/null
+
+      - name: Publish verified plan
+        env:
+          REVIEWED_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          {
+            echo "## Verified Terraform lab plan"
+            echo
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Source run ID: \`${SOURCE_RUN_ID}\`"
+            echo "- Saved-plan SHA-256: \`${REVIEWED_PLAN_SHA256,,}\`"
+            echo
+            echo "<details><summary>Plan being applied</summary>"
+            echo
+            echo '```text'
+            cat "${PLAN_DIR}/plan.txt"
+            echo '```'
+            echo "</details>"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.1
+          terraform_wrapper: false
+
+      - name: Create provider cache
+        run: |
+          echo "TF_PLUGIN_CACHE_DIR=${RUNNER_TEMP}/terraform-plugin-cache" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/terraform-plugin-cache"
+
+      - name: Authenticate as the apply identity
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/123456789012/locations/global/workloadIdentityPools/github-cloud-infra-lab/providers/github-oidc
+          service_account: cloud-infra-lab-apply@example-gcp-project.iam.gserviceaccount.com
+          project_id: example-gcp-project
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Initialize lab backend
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform init -input=false
+
+      - name: Verify saved plan rendering
+        run: |
+          terraform -chdir="${TF_ROOT}" show -no-color \
+            "${GITHUB_WORKSPACE}/${PLAN_DIR}/${PLAN_FILE}" \
+            > "${PLAN_DIR}/verified-plan.txt"
+          diff -u "${PLAN_DIR}/plan.txt" "${PLAN_DIR}/verified-plan.txt"
+
+      - name: Apply exact saved plan
+        run: |
+          terraform -chdir="${TF_ROOT}" apply \
+            -input=false \
+            "${GITHUB_WORKSPACE}/${PLAN_DIR}/${PLAN_FILE}"
+
+      - name: Verify zero drift
+        working-directory: ${{ env.TF_ROOT }}
+        run: |
+          terraform plan \
+            -input=false \
+            -lock-timeout=5m \
+            -detailed-exitcode \
+            -no-color
+
+      - name: Publish apply result
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          {
+            echo
+            echo "## Apply complete"
+            echo
+            echo "The exact saved plan from run \`${SOURCE_RUN_ID}\` was applied."
+            echo "A post-apply refresh confirmed zero drift."
+          } >> "${GITHUB_STEP_SUMMARY}"

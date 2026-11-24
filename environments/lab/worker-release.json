@@ -1,0 +1,16 @@
+{
+  "build_manifest_sha256": null,
+  "dockerfile_sha256": null,
+  "evidence": "legacy-summary-only",
+  "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "image_ref": "europe-central2-docker.pkg.dev/example-gcp-project/cloud-infra-lab/event-metadata-worker@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "provenance_sha256": null,
+  "repository": "winndzor/cloud-infra-automation-lab",
+  "sbom_sha256": null,
+  "schema_version": 1,
+  "service_tree": null,
+  "source_commit": "0000000000000000000000000000000000000000",
+  "source_run_attempt": "1",
+  "source_run_id": "1",
+  "source_workflow_ref": "winndzor/cloud-infra-automation-lab/.github/workflows/container-build.yml@refs/heads/main"
+}
